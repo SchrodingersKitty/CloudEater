@@ -1,0 +1,141 @@
+﻿#pragma kernel CSMain
+
+RWStructuredBuffer<float4> Result;
+int Size;
+int2 Octaves;
+float2 Freqs;
+int2 Inverts;
+
+// Hash by shadertoy user David_Hoskins
+// Noise by shadertoy user piyushslayer
+#define UI3 uint3(1597334673U, 3812015801U, 2798796415U);
+#define UIF 1.f / 0xffffffffU;
+
+float3 hash(float3 p)
+{
+    uint3 q = (uint3)p * UI3;
+    q = (q.x ^ q.y ^ q.z) * UI3;
+    return (float3)q * UIF;
+}
+
+float3 mod(float3 x, float3 y)
+{
+    return x - y * floor(x / y);
+}
+
+float Worley(float3 uv, float freq)
+{
+    uv *= freq;
+    float3 id = floor(uv); // cubic grid position
+    float3 p = frac(uv); // position inside unit cube
+    
+    float dist = 10000.f;
+    for(int k=-1; k<=1; k++)
+    {
+        for(int j=-1; j<=1; j++)
+        {
+            for(int i=-1; i<=1; i++)
+            {
+                float3 offset = float3(i, j, k); // neighborhood offset
+                // fucking fmod() != GLSL mod()
+                //float3 t = math.fmod(id + offset, (float3)freq);
+                float3 t = mod(id + offset, (float3)freq); // repeating pattern
+                float3 h = hash(t) + offset; // position of random (hashed) point in neighborhood
+                float3 d = p - h;
+                dist = min(dist, dot(d, d)); // shortest distance
+            }
+        }
+    }
+    return dist;
+}
+
+float WorleyFbm(float3 uv, float freq, int octaves)
+{
+    // finite (especially low octave) FBM doesn't fully saturate the value range
+    // let's calculate the remainder and proportionally distribute it among layers
+    float rem = 1.f - pow(2.f, -octaves); // one minus remainder (1 - 2^-n)
+    float val = 0.f; // cumulative value
+    for(int i = 1; i <= octaves; i++)
+    {
+        float f = pow(2.f, i); // frequency multiplier 2^i
+        float r = 1.f / f*rem; // proportional amplitude term 1 / 2^i * (1 - 2^-n)
+        val += Worley(uv, freq * f) * r;
+    }
+    return val;
+}
+
+float Gradient(float3 uv, float freq)
+{
+    uv *= freq;
+    // grid
+    float3 p = floor(uv);
+    float3 w = frac(uv);
+
+    // quintic interpolant
+    float3 u = w * w * w * (w * (w * 6. - 15.) + 10.);
+
+    // gradients
+    float3 ga = hash(mod(p + float3(0.f, 0.f, 0.f), (float3)freq)) * 2.f - 1.f;
+    float3 gb = hash(mod(p + float3(1.f, 0.f, 0.f), (float3)freq)) * 2.f - 1.f;
+    float3 gc = hash(mod(p + float3(0.f, 1.f, 0.f), (float3)freq)) * 2.f - 1.f;
+    float3 gd = hash(mod(p + float3(1.f, 1.f, 0.f), (float3)freq)) * 2.f - 1.f;
+    float3 ge = hash(mod(p + float3(0.f, 0.f, 1.f), (float3)freq)) * 2.f - 1.f;
+    float3 gf = hash(mod(p + float3(1.f, 0.f, 1.f), (float3)freq)) * 2.f - 1.f;
+    float3 gg = hash(mod(p + float3(0.f, 1.f, 1.f), (float3)freq)) * 2.f - 1.f;
+    float3 gh = hash(mod(p + float3(1.f, 1.f, 1.f), (float3)freq)) * 2.f - 1.f;
+    
+    // projections
+    float va = dot(ga, w - float3(0.f, 0.f, 0.f));
+    float vb = dot(gb, w - float3(1.f, 0.f, 0.f));
+    float vc = dot(gc, w - float3(0.f, 1.f, 0.f));
+    float vd = dot(gd, w - float3(1.f, 1.f, 0.f));
+    float ve = dot(ge, w - float3(0.f, 0.f, 1.f));
+    float vf = dot(gf, w - float3(1.f, 0.f, 1.f));
+    float vg = dot(gg, w - float3(0.f, 1.f, 1.f));
+    float vh = dot(gh, w - float3(1.f, 1.f, 1.f));
+	
+    // interpolation
+    return va + 
+           u.x * (vb - va) + 
+           u.y * (vc - va) + 
+           u.z * (ve - va) + 
+           u.x * u.y * (va - vb - vc + vd) + 
+           u.y * u.z * (va - vc - ve + vg) + 
+           u.z * u.x * (va - vb - ve + vf) + 
+           u.x * u.y * u.z * (-va + vb + vc - vd + ve - vf - vg + vh);
+}
+
+float GradientFbm(float3 uv, float freq, int octaves)
+{
+    // finite (especially low octave) FBM doesn't fully saturate the value range
+    // let's calculate the remainder and proportionally distribute it among layers
+    float rem = 1.f - pow(2.f, -octaves); // one minus remainder (1 - 2^-n)
+    float val = 0.f; // cumulative value
+    for(int i = 1; i <= octaves; i++)
+    {
+        float f = pow(2.f, i); // frequency multiplier 2^i
+        float r = 1.f / f*rem; // proportional amplitude term 1 / 2^i * (1 - 2^-n)
+        val += Gradient(uv, freq * f) * r;
+    }
+    return val;
+}
+
+float remap(float x, float i0, float i1, float o0, float o1)
+{
+    return (x-i0)/(i1-i0)*(o1-o0)+o0;
+}
+
+[numthreads(8,8,8)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float3 uv = id / (float)Size;
+
+    float p = GradientFbm(uv, Freqs.x, Octaves.x);
+    float w = WorleyFbm(uv, Freqs.x, Octaves.x);
+    w = 1.f - w;
+    float res = w - 0.1f;//saturate(w + p * 0.5);
+    //w = Inverts.x > 0 ? 1.f - w : w;
+
+    uint i = id.x + id.y * Size + id.z * Size * Size;
+    Result[i] = (float4)res;
+}

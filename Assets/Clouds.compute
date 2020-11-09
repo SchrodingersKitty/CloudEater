@@ -1,0 +1,255 @@
+﻿#pragma kernel CSMain
+#pragma kernel CSMain DITHER_ON
+#pragma kernel CSMain COLOR_MODE
+#pragma kernel CSMain DEBUG_SAMPLES
+
+// suppressing negative pow warning in phase function
+#pragma warning (disable : 3571)
+
+// FINAL IMAGE
+RWTexture2D<float4> Result;
+float2 _ScreenSize;
+//
+
+// CAMERA PROJECTION
+float4x4 _Mx_InvVP;
+float4x4 _Mx_V;
+float3 _Origin;
+float2 _Clip;
+//
+
+// SCENE DEPTH
+Texture2D<float> _CameraDepthTexture;
+SamplerState LinearClampSampler;
+float4 _ZBufferParams;
+//
+
+// BLUE NOISE
+#if DITHER_ON
+Texture2D<float> _BlueNoise;
+SamplerState PointRepeatSampler;
+#endif
+//
+
+// LIGHT DATA
+float3 _MainLightDir;
+float _Beer;
+float3 _HG;
+//
+
+// GEOMETRY DATA
+float3 _CloudLayers;
+//
+
+// VOLUME DATA
+Texture3D<float> _Volume;
+SamplerState sampler_Volume;
+//
+
+// CONSTANTS
+#define STEPS 512
+#define STEPS_LIGHT 8 // 5 may be fine
+#define STEP_SIZE_LIGHT 0.5f
+#define SCALE 0.3f
+#define NOISE_STRENGTH 0.1f
+#define EPS 0.01f
+#define PI 3.14159265f
+//
+
+// TODO: REPLACE THIS
+float _sample(float3 p)
+{
+    float s = _Volume.SampleLevel(sampler_Volume, p * SCALE * 0.1f, 0);
+    return saturate(s - 0.62f);
+}
+
+struct Ray
+{
+    float3 pos;
+    float3 dir;
+};
+
+// Plane intersection
+float IntersectPlane(Ray ray, float plane)
+{
+    return (plane - ray.pos.y) / ray.dir.y;
+}
+
+// Density integrator
+float2 IntegrateDensity(float3 pos, inout float2 sN, float step)
+{
+    sN.x = _sample(pos);
+    float delta = abs(sN.x - sN.y);
+    sN.y = sN.x;
+    // sN.x * step; rectangular integration
+    // (sN.x + sN.y) / 2.f * step; trapezoid integration
+    return float2(sN.x * step, delta);
+}
+
+// Scene depth from texture
+float SceneDepth(uint2 id)
+{
+    //float depth = _CameraDepthTexture.SampleLevel(LinearClampSampler, id / _ScreenSize, 0);
+    float4 s = _CameraDepthTexture.Gather(LinearClampSampler, (id + 0.5f) / _ScreenSize);
+    float depth = min(min(s.x, s.y), min(s.z, s.w));
+    return 1.0f / (_ZBufferParams.z * depth + _ZBufferParams.w);
+}
+
+// Ray depth in frustum
+float RayDepth(float3 pos)
+{
+    return abs(mul(_Mx_V, float4(pos, 1.f)).z);
+}
+
+Ray CreateCameraRay(uint2 id)
+{
+    Ray ray;
+    float2 uv = 2.f * id / _ScreenSize - 1.f; // screen uv [-1;1]
+    // get world space projection vector by multiplying by inverse VP matrix
+    ray.dir = mul(_Mx_InvVP, float4(uv, 0.f, 1.f)).xyz;
+    ray.pos = _Origin + ray.dir * _Clip.x; // start at near clip pane
+    ray.dir = normalize(ray.dir);
+    return ray;
+}
+
+Ray CreateLightRay(float3 pos, float3 lightDir)
+{
+    Ray ray;
+    ray.pos = pos;
+    ray.dir = -lightDir;
+    return ray;
+}
+
+// Henyey-Greenstein phase function
+float HG(float theta, float g)
+{
+    float g2 = g*g;
+    return (1.f - g2) / 4 * PI * pow(1.f + g2 - 2.f * g * theta, 1.5f);
+}
+
+// Two-lobe Henyey-Greenstein
+float Phase(float theta)
+{
+    return lerp(HG(theta, _HG.x), HG(theta, _HG.y), _HG.z);
+}
+
+float SelfShadow(float3 pos, float3 lightDir, float T)
+{
+    Ray ray = CreateLightRay(pos, lightDir);
+    float step = STEP_SIZE_LIGHT;
+    ray.pos += ray.dir * step;
+
+    float2 sN = (float2)0.f;
+    float2 density = (float2)0.f;
+    float2 total = (float2)0.f;
+
+    //uint steps = STEPS_LIGHT * T + 1;
+    uint steps = STEPS_LIGHT;
+    for(uint i = 0; i < steps; i++)
+    {
+        //if(ray.pos.y > _CloudLayers.z) break;
+        density = IntegrateDensity(ray.pos, sN, step);
+        total += density;
+        ray.pos += ray.dir * step * (2.f - density.y);
+    }
+    // light estimator, very flawed
+    // TODO: rewrite?
+    /*float avgChange = total.y / steps;
+    uint estSteps = STEPS_LIGHT - steps;
+    float estChange = estSteps * (estSteps - 1) / 2.f * avgChange + estSteps * density.x;
+    total.x += saturate(estChange);*/
+    return exp(-total.x * _Beer);
+}
+
+// Energy-conserving light integrator by Sébastien Hillaire 2016
+float IntegrateLight(Ray ray, float T, float density)
+{
+    // assuming scattering = extinction = density
+    float S = density * SelfShadow(ray.pos, _MainLightDir, T) * Phase(dot(ray.dir, _MainLightDir));
+    float Sint = (S - S * exp(-density * _Beer)) / density;
+    return T * Sint;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID, uint gid : SV_GroupIndex)
+{
+    Ray ray = CreateCameraRay(id.xy);
+
+    float maxDepth = SceneDepth(id.xy);
+
+    // _Clip.y is the median target, rather than max draw distance
+    float defaultStep = _Clip.y / STEPS;
+    float step = defaultStep;
+
+#if DITHER_ON
+    // Offset with blue noise
+    float bn = _BlueNoise.SampleLevel(PointRepeatSampler, id.xy / 64.f, 0);
+    ray.pos += ray.dir * step * bn;
+#endif
+
+    float T = 1.f; // transmittance
+    float light = 0.f;
+
+#if DEBUG_SAMPLES
+    uint nSamples = 0;
+#endif
+    // raymarch loop
+    float2 sN = (float2)0.f; // x: current sample, y: previous sample
+    float2 density = (float2)0.f; // x: integrated density, y: delta from previous sample
+    for(uint i = 0; i < STEPS; i++)
+    {
+        density = IntegrateDensity(ray.pos, sN, step);
+#if DEBUG_SAMPLES
+        nSamples++;
+#endif
+        if(density.x > 0.f)
+        {
+            //light += density.x * T * SelfShadow(ray.pos, _MainLightDir, T) * Phase(dot(ray.dir, _MainLightDir)) * _Beer;
+            light += IntegrateLight(ray, T, density.x);
+            T *= exp(-density.x * _Beer);
+            if(T < EPS)
+            {
+                // discard heavily occluded samples (speed up by factor of ~10)
+                T = 0.f;
+                break;
+            }
+        }
+        // TODO: FINISH THE WORK ON LAYERS
+        float depth = RayDepth(ray.pos);
+        if(depth > maxDepth) break; // stop if hit an opaque
+        //float distTop = (_CloudLayers.z - ray.pos.y) / abs(ray.dir.y); //IntersectPlane(ray, _CloudLayers.z); // distance from top layer
+        //if(distTop < 0.f) break; // check for traversal outside cloud
+
+        float uniformityFactor = 2.f - density.y; // take bigger steps if samples are uniform
+        float distanceFactor = 1.f + depth / _Clip.y; // take bigger steps further away from camera
+        step = defaultStep * uniformityFactor * distanceFactor;
+#if DITHER_ON
+        step += defaultStep * bn * NOISE_STRENGTH;
+#endif
+        step = clamp(step, 0.f, maxDepth - depth + EPS); // avoid artifacting around opaques
+        //if(distTop > 0.f) step = clamp(step, 0.f, distTop + EPS); // avoid artifacting around top layer
+        ray.pos += ray.dir * step;
+        //if(ray.pos.y > _CloudLayers.z) break; // check for traversal outside cloud
+        /*{
+            float dist = IntersectPlane(ray, _CloudLayers.z);
+            if(dist > 0.f)
+            {
+                dist = (floor(dist / step)) * step;
+                ray.pos += ray.dir * dist;
+                if(RayDepth(ray.pos) > maxDepth) break;
+            }
+        }*/
+    }
+
+#if DEBUG_SAMPLES
+    float3 col = (float3)((float)nSamples / (float)STEPS);
+#elif COLOR_MODE
+    float3 darkCol = float3(0.25f, 0.3f, 0.35f);
+    float3 lightCol = float3(1.0f, 0.9f, 0.8f);
+    float3 col = lerp(darkCol, lightCol, light);
+#else
+    float3 col = (float3)light;
+#endif
+
+    Result[id.xy] = float4(col, 1.f - T);
+}
